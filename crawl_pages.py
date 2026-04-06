@@ -1,22 +1,27 @@
+import os
 import asyncio
 import argparse
+from collections import Counter
+import json
 import logging
 from pathlib import Path
+from collections import deque
 from urllib.parse import urljoin
 
 from playwright.async_api import async_playwright
 from libs_crawl import count_links, get_domain, group_links_by_domain, normalize_url, write_links_to_jsonl
 
+os.makedirs("./log/", exist_ok=True)
+LOG_FILE = Path("./log/crawl_pages.log")
 
-LOG_FILE = Path("crawl_playwright.log")
-DEFAULT_START_URL = ""
-DEFAULT_ALLOWED_DOMAINS = [""]
-DEFAULT_OUTPUT_FILE = Path("")
+OUTPUT_DIR = ("./crawl_output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+CONFIG_DIR = Path("config")
 
 def configure_logger() -> logging.Logger:
     # 進捗を画面とログファイルの両方へ出すロガーを初期化する。
-    logger = logging.getLogger("crawl_playwright")
+    logger = logging.getLogger("crawl_pages")
     if logger.handlers:
         return logger
 
@@ -41,13 +46,16 @@ class PlaywrightLinkCrawler:
         start_url: str,
         delay_seconds: float = 1,
         allowed_domains: list[str] | None = None,
+        max_pages: int = 1000,
     ) -> None:
         self.start_url = start_url
         self.delay_seconds = delay_seconds
+        self.max_pages = max_pages
         self.allowed_domains = {
             domain.lower().removeprefix("www.")
             for domain in (allowed_domains or [])
         }
+        self.disallowed_domain_counts: Counter[str] = Counter()
         self.logger = configure_logger()
         self.interactive_selector = ",".join(
             [
@@ -75,6 +83,10 @@ class PlaywrightLinkCrawler:
         domain = get_domain(url).removeprefix("www.")
         return domain in self.allowed_domains
 
+    def _record_disallowed_link(self, url: str) -> None:
+        domain = get_domain(url).removeprefix("www.")
+        self.disallowed_domain_counts[domain or "<unknown>"] += 1
+
     # 現在の画面に見えているアンカーリンクを収集する。
     async def _collect_anchor_links(self, page) -> list[str]:
         hrefs = []
@@ -90,6 +102,7 @@ class PlaywrightLinkCrawler:
             absolute_url = urljoin(page.url or self.start_url, href)
             normalized_url = normalize_url(absolute_url)
             if not self._is_allowed_link(normalized_url):
+                self._record_disallowed_link(normalized_url)
                 self.logger.info("skip disallowed link: %s", normalized_url)
                 continue
             if normalized_url in seen:
@@ -101,17 +114,21 @@ class PlaywrightLinkCrawler:
         return links
 
     # ボタン押下で動的に表示・遷移した先から追加リンクを収集する。
-    async def _collect_links_from_interactions(self, page) -> list[str]:
+    async def _collect_links_from_interactions(self, page, source_url: str) -> list[str]:
         discovered_links: list[str] = []
         seen = set()
 
         candidates = page.locator(self.interactive_selector)
         candidate_count = await candidates.count()
-        self.logger.info("found %s interactive candidates on %s", candidate_count, self.start_url)
+        self.logger.info("found %s interactive candidates on %s", candidate_count, source_url)
 
         for index in range(candidate_count):
-            await page.goto(self.start_url, wait_until="load")
-            await self._wait_for_page_stable(page)
+            try:
+                await page.goto(source_url, wait_until="load")
+                await self._wait_for_page_stable(page)
+            except Exception as exc:
+                self.logger.warning("failed to reload interaction source: %s | %s", source_url, exc)
+                break
 
             button = page.locator(self.interactive_selector).nth(index)
             try:
@@ -135,7 +152,10 @@ class PlaywrightLinkCrawler:
 
             if page.url != before_url:
                 normalized_url = normalize_url(page.url)
-                if self._is_allowed_link(normalized_url) and normalized_url not in seen:
+                if not self._is_allowed_link(normalized_url):
+                    self._record_disallowed_link(normalized_url)
+                    self.logger.info("skip disallowed navigated link: %s", normalized_url)
+                elif normalized_url not in seen:
                     seen.add(normalized_url)
                     discovered_links.append(normalized_url)
                     self.logger.info("discovered navigated link: %s", normalized_url)
@@ -151,27 +171,64 @@ class PlaywrightLinkCrawler:
 
     # 開始ページからリンク一覧を集めて正規化しながら重複を除く。
     async def _collect_links(self, page) -> list[str]:
-        self.logger.info("start collecting links from %s", self.start_url)
-        await page.goto(self.start_url, wait_until="load")
-        await self._wait_for_page_stable(page)
+        start_url = normalize_url(self.start_url)
+        discovered_links: list[str] = []
+        discovered_set: set[str] = set()
+        visited_pages: set[str] = set()
+        queued_pages: set[str] = {start_url}
+        pages_to_visit = deque([start_url])
 
-        links = []
-        seen = set()
-        for normalized_url in await self._collect_anchor_links(page):
-            if normalized_url in seen:
+        self.logger.info("start collecting links from %s", start_url)
+
+        while pages_to_visit and len(visited_pages) < self.max_pages:
+            current_url = pages_to_visit.popleft()
+            queued_pages.discard(current_url)
+            if current_url in visited_pages:
                 continue
-            seen.add(normalized_url)
-            links.append(normalized_url)
 
-        self.logger.info("anchor collection complete: %s links", len(links))
-        for normalized_url in await self._collect_links_from_interactions(page):
-            if normalized_url in seen:
+            visited_pages.add(current_url)
+            if current_url not in discovered_set:
+                discovered_set.add(current_url)
+                discovered_links.append(current_url)
+
+            try:
+                await page.goto(current_url, wait_until="load")
+                await self._wait_for_page_stable(page)
+            except Exception as exc:
+                self.logger.warning("page visit failed: %s | %s", current_url, exc)
                 continue
-            seen.add(normalized_url)
-            links.append(normalized_url)
 
-        self.logger.info("link collection complete: %s total links", len(links))
-        return links
+            page_links = await self._collect_anchor_links(page)
+            page_links.extend(await self._collect_links_from_interactions(page, current_url))
+
+            for normalized_url in page_links:
+                if normalized_url not in discovered_set:
+                    discovered_set.add(normalized_url)
+                    discovered_links.append(normalized_url)
+                if normalized_url in visited_pages or normalized_url in queued_pages:
+                    continue
+                queued_pages.add(normalized_url)
+                pages_to_visit.append(normalized_url)
+
+            self.logger.info(
+                "crawl progress: visited=%s queued=%s discovered=%s current=%s",
+                len(visited_pages),
+                len(pages_to_visit),
+                len(discovered_links),
+                current_url,
+            )
+
+        if pages_to_visit:
+            self.logger.warning(
+                "stopped before queue was exhausted: visited=%s discovered=%s remaining=%s max_pages=%s",
+                len(visited_pages),
+                len(discovered_links),
+                len(pages_to_visit),
+                self.max_pages,
+            )
+
+        self.logger.info("link collection complete: %s total links", len(discovered_links))
+        return discovered_links
 
     # 開始ページからURL一覧だけを取得する。
     async def fetch_links(self) -> list[str]:
@@ -231,38 +288,60 @@ class PlaywrightLinkCrawler:
                 await browser.close()
 
 
+def load_config(config_file: Path) -> dict:
+    with config_file.open("r", encoding="utf-8") as config_input:
+        config = json.load(config_input)
+
+    start_url = config.get("start_page_url")
+    allowed_domains = config.get("allowed_domains")
+    max_pages = config.get("max_pages", 1000)
+    output_file = config.get("output_file")
+
+    if not isinstance(start_url, str) or not start_url.strip():
+        raise ValueError("start_page_url must be a non-empty string.")
+    if not isinstance(allowed_domains, list) or not all(isinstance(domain, str) and domain.strip() for domain in allowed_domains):
+        raise ValueError("allowed_domains must be a non-empty list of strings.")
+    if not isinstance(max_pages, int) or max_pages <= 0:
+        raise ValueError("max_pages must be a positive integer.")
+    if not isinstance(output_file, str) or not output_file.strip():
+        raise ValueError("output_file must be a non-empty string.")
+
+    return {
+        "start_url": start_url,
+        "allowed_domains": allowed_domains,
+        "max_pages": max_pages,
+        "output_file": Path(output_file),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect links and titles with Playwright.")
     parser.add_argument(
-        "--start-url",
-        default=DEFAULT_START_URL,
-        help="Page URL to start crawling from.",
-    )
-    parser.add_argument(
-        "--allowed-domain",
-        action="append",
-        dest="allowed_domains",
-        help="Allowed domain. Repeat this option to allow multiple domains.",
-    )
-    parser.add_argument(
-        "--output",
+        "--config",
         type=Path,
-        default=DEFAULT_OUTPUT_FILE,
-        help="Output JSONL file path.",
+        default="crawl.jsonl",
+        help="Crawler config JSON file path.",
     )
     return parser.parse_args()
 
 
-async def get_links(start_url: str, allowed_domains: list[str], output_file: Path):
+async def get_links(start_url: str, allowed_domains: list[str], output_file: Path, max_pages: int):
     logger = configure_logger()
     crawler = PlaywrightLinkCrawler(
         start_url,
         allowed_domains=allowed_domains,
+        max_pages=max_pages,
     )
-    logger.info("crawler started: start_url=%s allowed_domains=%s", crawler.start_url, sorted(crawler.allowed_domains))
+    logger.info(
+        "crawler started: start_url=%s allowed_domains=%s max_pages=%s",
+        crawler.start_url,
+        sorted(crawler.allowed_domains),
+        crawler.max_pages,
+    )
     links_by_domain, total_count = await crawler.fetch_links_by_domain()
-    write_links_to_jsonl(links_by_domain, output_file)
-    logger.info("saved jsonl: %s", output_file)
+    filepath = OUTPUT_DIR / output_file
+    write_links_to_jsonl(links_by_domain, filepath)
+    logger.info("saved jsonl: %s", filepath)
     print(f"count={total_count}")
     print(f"saved={output_file}")
     print(f"log={LOG_FILE}")
@@ -270,15 +349,23 @@ async def get_links(start_url: str, allowed_domains: list[str], output_file: Pat
         print(f"[{domain}] count={len(items)}")
         for item in items:
             print(f"{item['url']} | {item['title']}")
+    if crawler.disallowed_domain_counts:
+        print("[excluded domains]")
+        for domain, count in crawler.disallowed_domain_counts.most_common():
+            print(f"{domain} | skipped={count}")
+    else:
+        print("[excluded domains] none")
 
 
 
 if __name__ == "__main__":
     args = parse_args()
+    config = load_config(args.config)
     asyncio.run(
         get_links(
-            start_url=args.start_url,
-            allowed_domains=args.allowed_domains or DEFAULT_ALLOWED_DOMAINS,
-            output_file=args.output,
+            start_url=config["start_url"],
+            allowed_domains=config["allowed_domains"],
+            output_file=config["output_file"],
+            max_pages=config["max_pages"],
         )
     )

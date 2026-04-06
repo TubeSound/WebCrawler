@@ -96,6 +96,19 @@ class Webpage2markdown:
         html = self.get_html_document()
         return self.extract_page_features(html)
 
+    def build_markdown_document(self, result: dict) -> str:
+        markdown_blocks = result.get("markdown_blocks", [])
+        if not markdown_blocks:
+            return result.get("markdown_text", "").strip()
+
+        parts = []
+        for block in markdown_blocks:
+            markdown = (block.get("markdown") or "").strip()
+            if not markdown:
+                continue
+            parts.append(markdown)
+        return "\n\n---\n\n".join(parts)
+
     # ノイズを除去する
     def _remove_noise(self, soup: BeautifulSoup) -> None:
         for selector in NOISE_SELECTORS:
@@ -404,6 +417,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="JSON output file path.",
     )
+    parser.add_argument(
+        "--markdown",
+        type=Path,
+        help="Markdown output file path.",
+    )
     return parser.parse_args()
 
 
@@ -411,15 +429,23 @@ def main() -> None:
     args = parse_args()
     extractor = Webpage2markdown(args.url)
     result = extractor.run()
+    markdown_document = extractor.build_markdown_document(result)
 
     json_output = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         path = OUTPUT_DIR / Path(args.output)
         path.write_text(json_output, encoding="utf-8")
         print(f"saved={args.output}")
-        return
+    else:
+        print(json_output)
 
-    print(json_output)
+    if args.markdown:
+        markdown_path = OUTPUT_DIR / Path(args.markdown)
+        markdown_path.write_text(markdown_document, encoding="utf-8")
+        print(f"saved={args.markdown}")
+    elif not args.output:
+        print("\n---\n")
+        print(markdown_document)
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ def configure_logger() -> logging.Logger:
     return logger
 
 
-class PlaywrightLinkCrawler:
+class CrawlPageLinks:
     def __init__(
         self,
         start_url: str,
@@ -56,6 +56,7 @@ class PlaywrightLinkCrawler:
             for domain in (allowed_domains or [])
         }
         self.disallowed_domain_counts: Counter[str] = Counter()
+        self.excluded_error_urls: list[str] = []
         self.logger = configure_logger()
         self.interactive_selector = ",".join(
             [
@@ -265,6 +266,10 @@ class PlaywrightLinkCrawler:
         finally:
             await page.close()
 
+    def _is_valid_title(self, title: str) -> bool:
+        normalized_title = title.strip()
+        return bool(normalized_title) and not normalized_title.startswith("ERROR:")
+
     # URLとタイトルをドメイン別の辞書にまとめて返す。
     async def fetch_links_by_domain(self) -> tuple[dict[str, list[dict[str, str]]], int]:
         async with async_playwright() as p:
@@ -277,6 +282,10 @@ class PlaywrightLinkCrawler:
                 link_items: list[dict[str, str]] = []
                 for url in links:
                     title = await self._fetch_page_title(browser, url)
+                    if not self._is_valid_title(title):
+                        self.excluded_error_urls.append(url)
+                        self.logger.info("skip errored url: %s | %s", url, title)
+                        continue
                     link_items.append({"url": url, "title": title})
 
                 result = group_links_by_domain(link_items)
@@ -327,7 +336,7 @@ def parse_args() -> argparse.Namespace:
 
 async def get_links(start_url: str, allowed_domains: list[str], output_file: Path, max_pages: int):
     logger = configure_logger()
-    crawler = PlaywrightLinkCrawler(
+    crawler = CrawlPageLinks(
         start_url,
         allowed_domains=allowed_domains,
         max_pages=max_pages,
@@ -349,6 +358,12 @@ async def get_links(start_url: str, allowed_domains: list[str], output_file: Pat
         print(f"[{domain}] count={len(items)}")
         for item in items:
             print(f"{item['url']} | {item['title']}")
+    if crawler.excluded_error_urls:
+        print(f"[excluded error urls] count={len(crawler.excluded_error_urls)}")
+        for url in crawler.excluded_error_urls:
+            print(url)
+    else:
+        print("[excluded error urls] none")
     if crawler.disallowed_domain_counts:
         print("[excluded domains]")
         for domain, count in crawler.disallowed_domain_counts.most_common():

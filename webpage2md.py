@@ -1,8 +1,9 @@
 import os
 import argparse
 import json
+import re
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Tag
 from markdownify import markdownify as md
@@ -10,10 +11,6 @@ from playwright.sync_api import sync_playwright
 
 
 HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6"]
-DECORATIVE_IMAGE_PATTERNS = [
-    "/img/common/icon_",
-    "/img/support/icon_",
-]
 NOISE_SELECTORS = [
     "script",
     "style",
@@ -21,11 +18,11 @@ NOISE_SELECTORS = [
     "svg",
     "iframe",
 ]
-MAIN_TEXT_TAGS = ["p", "li", "dt", "dd", "blockquote", "pre", "td", "th"]
 MARKDOWN_TAGS = ["p", "ul", "ol", "dl", "blockquote", "pre", "div", "section", "article"]
 MAX_LINKS = 300
 MAX_TABLES = 50
 MAX_SELECT_OPTIONS = 100
+DECORATIVE_IMAGE_MAX_SIZE = 24
 
 OUTPUT_DIR = "./preprocess"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -51,7 +48,7 @@ class Webpage2markdown:
                 page.close()
                 browser.close()
 
-    # ページ特徴量を抽出
+    # ページ諸元を抽出
     def extract_page_features(self, html: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
         self._remove_noise(soup)
@@ -122,20 +119,6 @@ class Webpage2markdown:
         return self._normalize_text(meta.get("content", ""))
 
     # 見出しを取得する
-    def _extract_headings(self, root: Tag) -> list[dict]:
-        headings = []
-        for tag in root.find_all(HEADING_TAGS):
-            text = self._normalize_text(tag.get_text(" ", strip=True))
-            if not text:
-                continue
-            headings.append(
-                {
-                    "level": tag.name,
-                    "text": text,
-                }
-            )
-        return headings
-
     # マークダウンブロックを抽出する
     def _extract_markdown_blocks(self, root: Tag) -> list[dict]:
         section_blocks = self._extract_section_markdown_blocks(root)
@@ -214,6 +197,7 @@ class Webpage2markdown:
             }
         )
 
+    # DOM を再帰的にたどり、Markdown 化に使う本文ノードだけを順番に取り出す。
     def _iter_markdown_nodes(self, root: Tag):
         for child in root.children:
             if not isinstance(child, Tag):
@@ -374,6 +358,7 @@ class Webpage2markdown:
     def _normalize_text(self, value: str) -> str:
         return " ".join(value.split())
 
+    # markdown_blocks に含まれる見出し情報だけを抜き出し、分類用の特徴量に使える形にする。
     def _extract_heading_texts_from_blocks(self, markdown_blocks: list[dict]) -> list[str]:
         heading_texts = []
         for block in markdown_blocks:
@@ -383,12 +368,14 @@ class Webpage2markdown:
                     heading_texts.append(text)
         return heading_texts
 
+    # 指定ノード配下で最初に見つかる見出しテキストを返す。
     def _find_first_heading(self, root: Tag) -> str:
         heading = root.find(HEADING_TAGS)
         if not heading:
             return ""
         return self._normalize_text(heading.get_text(" ", strip=True))
 
+    # section 配下の見出しタグを順番どおり収集し、構造情報として保持する。
     def _extract_section_heading_tags(self, section: Tag) -> list[dict]:
         heading_tags = []
         for heading in section.find_all(HEADING_TAGS):
@@ -403,6 +390,7 @@ class Webpage2markdown:
             )
         return heading_tags
 
+    # table の直前や親要素をたどって、表に対応する見出し文脈を推定する。
     def _find_table_heading(self, node: Tag) -> str:
         for previous in node.find_all_previous(HEADING_TAGS, limit=1):
             text = self._normalize_text(previous.get_text(" ", strip=True))
@@ -418,6 +406,7 @@ class Webpage2markdown:
             parent = parent.parent
         return ""
 
+    # HTML 断片を Markdown に変換し、後段で比較しやすい形に整える。
     def _tag_to_markdown_html(self, html: str) -> str:
         markdown = md(
             html,
@@ -427,6 +416,7 @@ class Webpage2markdown:
         ).strip()
         return self._cleanup_markdown(markdown)
 
+    # Markdown 化の前に、表や重複要素など不要なノイズを落とした複製 DOM を作る。
     def _prepare_tag_for_markdown(self, tag: Tag) -> BeautifulSoup:
         cloned = BeautifulSoup(str(tag), "html.parser")
         for table in cloned.find_all("table"):
@@ -435,24 +425,18 @@ class Webpage2markdown:
         self._remove_duplicate_text_nodes(cloned)
         return cloned
 
+    # 明らかな装飾画像を除外し、同じブロック内の重複画像をまとめる。
     def _remove_redundant_images(self, soup: BeautifulSoup) -> None:
         seen_image_keys = set()
         for image in soup.find_all("img"):
             src = image.get("src", "") or ""
             alt = self._normalize_text(image.get("alt", ""))
-            src_lower = src.lower()
 
-            if any(pattern in src_lower for pattern in DECORATIVE_IMAGE_PATTERNS):
+            if self._is_decorative_image(image):
                 image.decompose()
                 continue
 
-            normalized_src = (
-                src_lower
-                .replace("_pc.", ".")
-                .replace("_sp.", ".")
-                .replace("-pc.", ".")
-                .replace("-sp.", ".")
-            )
+            normalized_src = self._normalize_image_src(src)
             image_key = (normalized_src, alt)
             if image_key in seen_image_keys:
                 image.decompose()
@@ -460,6 +444,45 @@ class Webpage2markdown:
 
             seen_image_keys.add(image_key)
 
+    # 基本的には意味を持つ画像を残し、明示的な装飾画像か極小の無ラベル画像だけを除外する。
+    def _is_decorative_image(self, image: Tag) -> bool:
+        alt = self._normalize_text(image.get("alt", ""))
+        role = (image.get("role", "") or "").lower()
+        aria_hidden = (image.get("aria-hidden", "") or "").lower()
+
+        if role == "presentation" or aria_hidden == "true":
+            return True
+
+        width = self._parse_int(image.get("width"))
+        height = self._parse_int(image.get("height"))
+        if (
+            not alt
+            and width is not None
+            and height is not None
+            and max(width, height) <= DECORATIVE_IMAGE_MAX_SIZE
+        ):
+            return True
+
+        return False
+
+    # PC/SP などの派生ファイル名を吸収して、同じ画像として比較しやすくする。
+    def _normalize_image_src(self, src: str) -> str:
+        parts = urlsplit(src.lower())
+        path = parts.path
+        path = re.sub(r"([_-])(pc|sp|tb|mobile|desktop)(?=\.)", "", path)
+        path = re.sub(r"([_-])(@?2x|@?3x)(?=\.)", "", path)
+        return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+    # width や height のような数値属性を、24px のような値も含めて整数化する。
+    def _parse_int(self, value) -> int | None:
+        if value is None:
+            return None
+        match = re.search(r"\d+", str(value))
+        if not match:
+            return None
+        return int(match.group())
+
+    # 重複した DOM から生まれやすい、同一親直下の繰り返しテキスト要素を除外する。
     def _remove_duplicate_text_nodes(self, soup: BeautifulSoup) -> None:
         candidate_tags = ["p", "li", "dt", "dd", "span", "div"]
         for parent in soup.find_all(True):
@@ -474,6 +497,7 @@ class Webpage2markdown:
                     continue
                 seen_texts.add(text_key)
 
+    # Markdown 変換後の段落ブロックを組み直し、連続する重複ブロックをまとめる。
     def _cleanup_markdown(self, markdown: str) -> str:
         blocks = []
         current_lines = []
@@ -501,19 +525,13 @@ class Webpage2markdown:
 
         return "\n\n".join(cleaned_blocks).strip()
 
+    # Markdown ブロック比較前に、空白や改行の差だけを吸収する。
     def _normalize_markdown_block(self, block: str) -> str:
         normalized = block.replace("  \n", "\n")
         normalized = normalized.replace("\\\n", "\n")
         normalized = normalized.replace("\n", " ")
         normalized = self._normalize_text(normalized)
         return normalized
-
-    def _clone_without_tables(self, tag: Tag) -> BeautifulSoup:
-        cloned = BeautifulSoup(str(tag), "html.parser")
-        for table in cloned.find_all("table"):
-            table.decompose()
-        return cloned
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch a webpage and extract features for page classification.")

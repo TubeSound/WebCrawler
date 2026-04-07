@@ -10,6 +10,10 @@ from playwright.sync_api import sync_playwright
 
 
 HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6"]
+DECORATIVE_IMAGE_PATTERNS = [
+    "/img/common/icon_",
+    "/img/support/icon_",
+]
 NOISE_SELECTORS = [
     "script",
     "style",
@@ -55,9 +59,6 @@ class Webpage2markdown:
         root = soup.find("main") or soup.body or soup
         title = self._normalize_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
         meta = self._extract_meta(soup)
-        headings = self._extract_headings(root)
-        heading_texts = [item["text"] for item in headings]
-        heading_text = "\n".join(heading_texts)
         markdown_blocks = self._extract_markdown_blocks(root)
         markdown_text = "\n\n".join(block["markdown"] for block in markdown_blocks)
         links = self._extract_links(root)
@@ -66,9 +67,10 @@ class Webpage2markdown:
         forms = self._extract_form_elements(root)
 
         body_text = self._normalize_text(root.get_text("\n", strip=True))
+        heading_texts = self._extract_heading_texts_from_blocks(markdown_blocks)
         page_type_hints = self._infer_page_type_hints(
             title=title,
-            headings=headings,
+            heading_texts=heading_texts,
             body_text=body_text,
             tables=tables,
             links=links,
@@ -79,9 +81,6 @@ class Webpage2markdown:
             "url": self.url,
             "title": title,
             "meta": meta,
-            "headings": headings,
-            "heading_texts": heading_texts,
-            "heading_text": heading_text,
             "body_text": body_text,
             "markdown_blocks": markdown_blocks,
             "markdown_text": markdown_text,
@@ -163,19 +162,19 @@ class Webpage2markdown:
         sections = []
         seen_ids = set()
 
-        for tag in root.find_all(["section"], recursive=True):
+        for index, tag in enumerate(root.find_all(["section"], recursive=True), start=1):
             if not isinstance(tag, Tag):
                 continue
-            if tag.find("table"):
-                tag_for_markdown = self._clone_without_tables(tag)
-            else:
-                tag_for_markdown = tag
+            if tag.find_parent("section") is not None:
+                continue
+            tag_for_markdown = self._prepare_tag_for_markdown(tag)
 
             text = self._normalize_text(tag_for_markdown.get_text(" ", strip=True))
             if not text:
                 continue
 
             heading = self._find_first_heading(tag) or self._find_table_heading(tag)
+            heading_tags = self._extract_section_heading_tags(tag)
             html = str(tag_for_markdown)
             if html in seen_ids:
                 continue
@@ -187,8 +186,10 @@ class Webpage2markdown:
 
             sections.append(
                 {
+                    "section_index": index,
                     "heading": heading or "section",
                     "tag": "section",
+                    "heading_tags": heading_tags,
                     "markdown": markdown,
                 }
             )
@@ -199,7 +200,8 @@ class Webpage2markdown:
     def _append_markdown_block(self, blocks: list[dict], heading: str, nodes: list[Tag]) -> None:
         if not nodes:
             return
-        html = "\n".join(str(node) for node in nodes)
+        prepared_nodes = [self._prepare_tag_for_markdown(node) for node in nodes]
+        html = "\n".join(str(node) for node in prepared_nodes)
         markdown = self._tag_to_markdown_html(html)
         markdown = markdown.strip()
         if not markdown:
@@ -331,7 +333,7 @@ class Webpage2markdown:
     def _infer_page_type_hints(
         self,
         title: str,
-        headings: list[dict],
+        heading_texts: list[str],
         body_text: str,
         tables: list[dict],
         links: list[dict],
@@ -341,7 +343,7 @@ class Webpage2markdown:
         combined_text = " ".join(
             [
                 title,
-                " ".join(item["text"] for item in headings),
+                " ".join(heading_texts),
                 body_text[:4000],
             ]
         ).lower()
@@ -372,11 +374,34 @@ class Webpage2markdown:
     def _normalize_text(self, value: str) -> str:
         return " ".join(value.split())
 
+    def _extract_heading_texts_from_blocks(self, markdown_blocks: list[dict]) -> list[str]:
+        heading_texts = []
+        for block in markdown_blocks:
+            for heading in block.get("heading_tags", []):
+                text = self._normalize_text(heading.get("text", ""))
+                if text:
+                    heading_texts.append(text)
+        return heading_texts
+
     def _find_first_heading(self, root: Tag) -> str:
         heading = root.find(HEADING_TAGS)
         if not heading:
             return ""
         return self._normalize_text(heading.get_text(" ", strip=True))
+
+    def _extract_section_heading_tags(self, section: Tag) -> list[dict]:
+        heading_tags = []
+        for heading in section.find_all(HEADING_TAGS):
+            text = self._normalize_text(heading.get_text(" ", strip=True))
+            if not text:
+                continue
+            heading_tags.append(
+                {
+                    "tag": heading.name,
+                    "text": text,
+                }
+            )
+        return heading_tags
 
     def _find_table_heading(self, node: Tag) -> str:
         for previous in node.find_all_previous(HEADING_TAGS, limit=1):
@@ -400,7 +425,88 @@ class Webpage2markdown:
             bullets="-",
             strip=["table"],
         ).strip()
-        return markdown
+        return self._cleanup_markdown(markdown)
+
+    def _prepare_tag_for_markdown(self, tag: Tag) -> BeautifulSoup:
+        cloned = BeautifulSoup(str(tag), "html.parser")
+        for table in cloned.find_all("table"):
+            table.decompose()
+        self._remove_redundant_images(cloned)
+        self._remove_duplicate_text_nodes(cloned)
+        return cloned
+
+    def _remove_redundant_images(self, soup: BeautifulSoup) -> None:
+        seen_image_keys = set()
+        for image in soup.find_all("img"):
+            src = image.get("src", "") or ""
+            alt = self._normalize_text(image.get("alt", ""))
+            src_lower = src.lower()
+
+            if any(pattern in src_lower for pattern in DECORATIVE_IMAGE_PATTERNS):
+                image.decompose()
+                continue
+
+            normalized_src = (
+                src_lower
+                .replace("_pc.", ".")
+                .replace("_sp.", ".")
+                .replace("-pc.", ".")
+                .replace("-sp.", ".")
+            )
+            image_key = (normalized_src, alt)
+            if image_key in seen_image_keys:
+                image.decompose()
+                continue
+
+            seen_image_keys.add(image_key)
+
+    def _remove_duplicate_text_nodes(self, soup: BeautifulSoup) -> None:
+        candidate_tags = ["p", "li", "dt", "dd", "span", "div"]
+        for parent in soup.find_all(True):
+            seen_texts = set()
+            for child in list(parent.find_all(candidate_tags, recursive=False)):
+                text = self._normalize_text(child.get_text(" ", strip=True))
+                if not text:
+                    continue
+                text_key = (child.name, text)
+                if text_key in seen_texts:
+                    child.decompose()
+                    continue
+                seen_texts.add(text_key)
+
+    def _cleanup_markdown(self, markdown: str) -> str:
+        blocks = []
+        current_lines = []
+
+        for line in markdown.splitlines():
+            if line.strip():
+                current_lines.append(line.rstrip())
+                continue
+            if current_lines:
+                blocks.append("\n".join(current_lines).strip())
+                current_lines = []
+        if current_lines:
+            blocks.append("\n".join(current_lines).strip())
+
+        cleaned_blocks = []
+        previous_block_key = ""
+        for block in blocks:
+            block_key = self._normalize_markdown_block(block)
+            if not block_key:
+                continue
+            if block_key == previous_block_key:
+                continue
+            cleaned_blocks.append(block)
+            previous_block_key = block_key
+
+        return "\n\n".join(cleaned_blocks).strip()
+
+    def _normalize_markdown_block(self, block: str) -> str:
+        normalized = block.replace("  \n", "\n")
+        normalized = normalized.replace("\\\n", "\n")
+        normalized = normalized.replace("\n", " ")
+        normalized = self._normalize_text(normalized)
+        return normalized
 
     def _clone_without_tables(self, tag: Tag) -> BeautifulSoup:
         cloned = BeautifulSoup(str(tag), "html.parser")

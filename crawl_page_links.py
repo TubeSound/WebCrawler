@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 from collections import deque
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import async_playwright
 from libs_crawl import count_links, get_domain, group_links_by_domain, normalize_url, write_links_to_jsonl
@@ -52,8 +52,9 @@ class CrawlPageLinks:
         self.delay_seconds = delay_seconds
         self.max_pages = max_pages
         self.allowed_domains = {
-            domain.lower().removeprefix("www.")
+            self._normalize_allowed_domain(domain)
             for domain in (allowed_domains or [])
+            if self._normalize_allowed_domain(domain)
         }
         self.disallowed_domain_counts: Counter[str] = Counter()
         self.excluded_error_urls: list[str] = []
@@ -67,6 +68,32 @@ class CrawlPageLinks:
                 "[tabindex='0']",
             ]
         )
+
+    # 実ブラウザに近い設定でコンテキストを作り、単純な bot 判定で弾かれにくくする。
+    async def _new_browser_context(self, browser):
+        return await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            locale="ja-JP",
+            timezone_id="Asia/Tokyo",
+            viewport={"width": 1440, "height": 900},
+            extra_http_headers={
+                "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+        )
+
+    # 設定ファイルの許可ドメインは、URL形式や末尾スラッシュ付きでも比較できる形へ正規化する。
+    def _normalize_allowed_domain(self, value: str) -> str:
+        candidate = (value or "").strip().lower()
+        if not candidate:
+            return ""
+
+        parsed = urlparse(candidate if "://" in candidate else f"https://{candidate}")
+        domain = (parsed.netloc or parsed.path).strip().strip("/")
+        return domain.removeprefix("www.")
 
     # 読み込み直後のDOM変化を待って、クリックや抽出を安定させる。
     async def _wait_for_page_stable(self, page) -> None:
@@ -235,17 +262,20 @@ class CrawlPageLinks:
     async def fetch_links(self) -> list[str]:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+            context = await self._new_browser_context(browser)
+            page = await context.new_page()
 
             try:
                 return await self._collect_links(page)
             finally:
                 await page.close()
+                await context.close()
                 await browser.close()
 
     # 指定したURLを開いてページタイトルを取得する。
     async def _fetch_page_title(self, browser, url: str) -> str:
-        page = await browser.new_page()
+        context = await self._new_browser_context(browser)
+        page = await context.new_page()
         try:
             self.logger.info("fetch title: %s", url)
             await page.goto(url, wait_until="load", timeout=60_000)
@@ -265,6 +295,7 @@ class CrawlPageLinks:
             return f"ERROR: {exc}"
         finally:
             await page.close()
+            await context.close()
 
     def _is_valid_title(self, title: str) -> bool:
         normalized_title = title.strip()
@@ -274,7 +305,8 @@ class CrawlPageLinks:
     async def fetch_links_by_domain(self) -> tuple[dict[str, list[dict[str, str]]], int]:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            listing_page = await browser.new_page()
+            context = await self._new_browser_context(browser)
+            listing_page = await context.new_page()
 
             try:
                 links = await self._collect_links(listing_page)
@@ -294,6 +326,7 @@ class CrawlPageLinks:
                 return result, total_count
             finally:
                 await listing_page.close()
+                await context.close()
                 await browser.close()
 
 
@@ -315,9 +348,17 @@ def load_config(config_file: Path) -> dict:
     if not isinstance(output_file, str) or not output_file.strip():
         raise ValueError("output_file must be a non-empty string.")
 
+    normalized_allowed_domains = []
+    for domain in allowed_domains:
+        candidate = domain.strip().lower()
+        parsed = urlparse(candidate if "://" in candidate else f"https://{candidate}")
+        normalized_domain = (parsed.netloc or parsed.path).strip().strip("/").removeprefix("www.")
+        if normalized_domain:
+            normalized_allowed_domains.append(normalized_domain)
+
     return {
         "start_url": start_url,
-        "allowed_domains": allowed_domains,
+        "allowed_domains": normalized_allowed_domains,
         "max_pages": max_pages,
         "output_file": Path(output_file),
     }
